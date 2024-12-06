@@ -1,12 +1,13 @@
 import ssl
 import json
+import argparse
 from time import sleep
 from base64 import b64encode
+from dataclasses import dataclass
 
 import requests
 from requests.adapters import HTTPAdapter, PoolManager
 from requests.packages import urllib3
-
 from Crypto.Cipher import PKCS1_v1_5
 from Crypto.PublicKey import RSA
 
@@ -29,27 +30,24 @@ class TLSv1_2HttpAdapter(HTTPAdapter):
             ssl_context=ssl_context)
 
 
+@dataclass
+class WifiNetwork:
+    ssid: str
+    wpa_auth: int
+    wpa_cipher: int
+
+
 class GAApi:
-    def __init__(self, ip: str = "192.168.255.249"):
+    def __init__(self, ip=None):
         self.s = requests.Session()
         self.s.verify = False
         self.s.timeout = 5
         self.s.mount('https://', TLSv1_2HttpAdapter())
 
+        if not ip:
+            ip = "192.168.255.249"
+            print(f"No IP informed, using default {ip}")
         self.CHROMECAST_HOST = f"https://{ip}:8443"
-
-    def scan_wifi(self, ssid=False):
-        r = self._request_endpoint(
-            self.s.post(f"{self.CHROMECAST_HOST}/setup/scan_wifi"))
-        print(r.text)
-        sleep(10)
-        r = self.s.get(f"{self.CHROMECAST_HOST}/setup/scan_results")
-        for i in r.json():
-            if 'ssid' in i and i['ssid'] == ssid:
-                wpa_auth, wpa_cipher = i['wpa_auth'], i['wpa_cipher']
-                return [ssid, wpa_auth, wpa_cipher]
-        else:
-            return {x["ssid"] for x in r.json()}
 
     def _request_endpoint(self, obj):
         try:
@@ -61,41 +59,65 @@ class GAApi:
         else:
             return request_
 
-    def get_info(self):
+    def scan_wifi(self, ssid=None):
+        r = self._request_endpoint(
+            self.s.post(f"{self.CHROMECAST_HOST}/setup/scan_wifi"))
+        print("Scanning networks...")
+        sleep(10)
+        r = self.s.get(f"{self.CHROMECAST_HOST}/setup/scan_results")
+        for i in r.json():
+            if 'ssid' in i and i['ssid'] == ssid:
+                return WifiNetwork(ssid, i['wpa_auth'], i['wpa_cipher'])
+        else:
+            return [WifiNetwork(i['ssid'], i['wpa_auth'], i['wpa_cipher'])
+                    for i in r.json()]
+
+    def get_info(self) -> dict:
         r = self._request_endpoint(
             self.s.get(f"{self.CHROMECAST_HOST}/setup/eureka_info"))
-        return json.dumps(r.json(), indent=4)
+        return r.json()
+
+    def list_networks(self) -> dict:
+        r = self._request_endpoint(
+            self.s.get(f"{self.CHROMECAST_HOST}/setup/configured_networks"))
+        return r.json()
+
+    def forget_network(self, id_: int) -> dict:
+        r = self._request_endpoint(
+            self.s.post(
+                f"{self.CHROMECAST_HOST}/setup/forget_wifi",
+                json={
+                    "wpa_id": id_
+                }))
+        return r
 
     def connect_wifi(
             self,
-            ssid,
-            password=None,
-            wpa_auth=None,
-            wpa_cipher=None):
-        r = self._request_endpoint(
-            self.s.get(f"{self.CHROMECAST_HOST}/setup/eureka_info"))
-        public_key = r.json()["public_key"]
-
-        public_key = f"-----BEGIN RSA PUBLIC KEY-----\n{public_key}\n-----END RSA PUBLIC KEY-----"
+            wifi,
+            password=None):
+        r = self.get_info()
+        public_key = ("-----BEGIN RSA PUBLIC KEY-----\n"
+                      + r["public_key"]
+                      + "\n-----END RSA PUBLIC KEY-----")
         rsa_key = RSA.importKey(public_key)
         cipher = PKCS1_v1_5.new(rsa_key)
 
         connect_command = {
-            "ssid": ssid,
-            "wpa_auth": wpa_auth,
-            "wpa_cipher": wpa_cipher,
-            "enc_passwd": b64encode(cipher.encrypt(password.encode()))}
+            "ssid": wifi.ssid,
+            "wpa_auth": wifi.wpa_auth,
+            "wpa_cipher": wifi.wpa_cipher,
+            "enc_passwd": b64encode(
+                cipher.encrypt(password.encode())).decode()}
 
         r = self.s.post(
             f"{self.CHROMECAST_HOST}/setup/connect_wifi", json=connect_command)
-        print(r.text)
 
         sleep(2)
 
         r = self.s.post(
             f"{self.CHROMECAST_HOST}/setup/save_wifi",
             json={"keep_hotspot_until_connected": True})
-        print(r.text)
+        return r.text
 
     def set_name(self, name: str) -> str:
         r = self.s.post(
@@ -111,6 +133,69 @@ class GAApi:
         return r.text
 
 
+def main():
+    parser = argparse.ArgumentParser(
+        prog='setupchromecast',
+        description='Setup Chromecast device without Google Home app')
+    parser.add_argument(
+        '--ip',
+        default=False,
+        help='IP of the device')
+    parser.add_argument(
+        '--connect',
+        action='store_true',
+        default=None,
+        help='Connect to a new network')
+    parser.add_argument(
+        '--name',
+        default=None,
+        help='Change the Chromecast device name')
+    parser.add_argument(
+        '--list',
+        action='store_true',
+        default=False,
+        help='List configured networks')
+    parser.add_argument(
+        '--forget',
+        action='store_true',
+        default=False,
+        help='Forget configured network')
+    parser.add_argument(
+        '--info',
+        action='store_true',
+        default=False,
+        help='Get device info')
+
+    args = parser.parse_args()
+
+    a = GAApi(ip=args.ip)
+
+    if args.connect:
+        networks = {str(x): y for x, y in enumerate(a.scan_wifi())}
+        for i in networks.items():
+            print(f"ID {i[0]}: {i[1].ssid}")
+        id_ = input("Select ID of the network to connect: ")
+        passwd = input("Wifi password: ")
+        print(a.connect_wifi(wifi=networks.get(id_), password=passwd))
+
+    if args.name:
+        print(a.set_name(args.name))
+
+    if args.forget:
+        for i in a.list_networks():
+            print(f"ID {i['wpa_id']}: {i['ssid']}")
+        id_ = input("Select ID of the network to forget: ")
+        print(a.forget_network(int(id_)))
+
+    if args.list:
+        print(
+            "\n".join(
+                [f"ID {i['wpa_id']}: {i['ssid']}"
+                 for i in a.list_networks()]))
+
+    if args.info:
+        print(json.dumps(a.get_info(), indent=4))
+
+
 if __name__ == "__main__":
-    a = GAApi(ip="10.0.0.73")
-    print(a.scan_wifi())
+    main()
