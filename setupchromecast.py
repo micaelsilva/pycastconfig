@@ -8,8 +8,7 @@ from dataclasses import dataclass
 import requests
 from requests.adapters import HTTPAdapter, PoolManager
 from requests.packages import urllib3
-from Crypto.Cipher import PKCS1_v1_5
-from Crypto.PublicKey import RSA
+import rsa
 
 urllib3.disable_warnings()
 
@@ -99,15 +98,14 @@ class GAApi:
         public_key = ("-----BEGIN RSA PUBLIC KEY-----\n"
                       + r["public_key"]
                       + "\n-----END RSA PUBLIC KEY-----")
-        rsa_key = RSA.importKey(public_key)
-        cipher = PKCS1_v1_5.new(rsa_key)
+        rsa_key = rsa.PublicKey.load_pkcs1(public_key)
 
         connect_command = {
             "ssid": wifi.ssid,
             "wpa_auth": wifi.wpa_auth,
             "wpa_cipher": wifi.wpa_cipher,
             "enc_passwd": b64encode(
-                cipher.encrypt(password.encode())).decode()}
+                rsa.encrypt(password.encode(), rsa_key)).decode()}
 
         r = self.s.post(
             f"{self.CHROMECAST_HOST}/setup/connect_wifi", json=connect_command)
